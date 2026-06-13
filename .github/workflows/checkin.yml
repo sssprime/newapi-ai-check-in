@@ -1,4 +1,4 @@
-name: newapi.ai 自动签到
+name: newapi.ai check-in
 on:
   schedule:
     # Runs daily at 00:30 China Standard Time (16:30 UTC).
@@ -6,17 +6,17 @@ on:
   workflow_dispatch:
     inputs:
       accounts:
-        description: '账号配置 (JSON 格式，可选，不填则使用 secrets.ACCOUNTS)'
+        description: 'Account config JSON. Optional; uses secrets.ACCOUNTS when empty.'
         required: false
         type: string
         default: ''
       providers:
-        description: '自定义 Provider 配置 (JSON 格式，可选，不填则使用 secrets.PROVIDERS)'
+        description: 'Custom provider config JSON. Optional; uses secrets.PROVIDERS when empty.'
         required: false
         type: string
         default: ''
       debug:
-        description: '调试模式 (启用后会保存截图和 HTML 日志)'
+        description: 'Debug mode. Saves screenshots and HTML logs when enabled.'
         required: false
         type: boolean
 
@@ -30,7 +30,7 @@ jobs:
     env:
       PYTHONIOENCODING: utf-8
     steps:
-    - name: set beijing timezone
+    - name: Set Beijing timezone
       uses: szenius/set-timezone@v2.0
       with:
         timezoneWindows: "China Standard Time"
@@ -45,7 +45,7 @@ jobs:
       with:
         python-version: '3.11'
 
-    - name: 缓存 UV 依赖
+    - name: Cache uv dependencies
       uses: actions/cache@v4
       id: uv-cache
       with:
@@ -56,21 +56,21 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-uv-
 
-    - name: 安装依赖
+    - name: Install dependencies
       if: steps.uv-cache.outputs.cache-hit != 'true'
       run: |
-        echo "缓存未命中，开始安装项目依赖..."
+        echo "Cache miss; installing dependencies..."
         uv sync
-        echo "✅ 环境初始化完成"
+        echo "Environment initialized"
 
-    - name: 获取 Camoufox 版本
+    - name: Get Camoufox version
       id: camoufox-version
       run: |
         $version = uv run python -c "import importlib.metadata; print(importlib.metadata.version('camoufox'))"
         echo "version=$version" >> $env:GITHUB_OUTPUT
         echo "Camoufox version: $version"
 
-    - name: 缓存 Camoufox 浏览器
+    - name: Cache Camoufox browser
       uses: actions/cache@v4
       id: camoufox-cache
       with:
@@ -79,14 +79,14 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-camoufox-
 
-    - name: 安装 Camoufox 浏览器
+    - name: Install Camoufox browser
       if: steps.camoufox-cache.outputs.cache-hit != 'true'
       run: |
-        echo "缓存未命中，开始下载 Camoufox 浏览器..."
+        echo "Cache miss; downloading Camoufox browser..."
         uv run camoufox fetch
-        echo "✅ Camoufox 浏览器安装完成"
+        echo "Camoufox browser installed"
 
-    - name: 恢复登录状态缓存
+    - name: Restore login state cache
       uses: actions/cache/restore@v4
       with:
         path: |
@@ -95,7 +95,7 @@ jobs:
         restore-keys: |
           storage-state-
 
-    - name: 恢复余额历史缓存
+    - name: Restore balance history cache
       uses: actions/cache/restore@v4
       with:
         path: |
@@ -103,14 +103,15 @@ jobs:
         key: balance-hash-${{ hashFiles('balance_hash.txt') }}
         restore-keys: |
           balance-hash-
-            
-    - name: 执行签到
+
+    - name: Run check-in
       env:
         ACCOUNTS: ${{ inputs.accounts || secrets.ACCOUNTS }}
         ACCOUNTS_LINUX_DO: ${{ secrets.ACCOUNTS_LINUX_DO }}
         ACCOUNTS_GITHUB: ${{ secrets.ACCOUNTS_GITHUB }}
+        RUN_LINUXDO_LOGIN_MANUAL: true
         PROVIDERS: ${{ inputs.providers || secrets.PROVIDERS }}
-        PROXY: ${{secrets.PROXY}}
+        PROXY: ${{ secrets.PROXY }}
         STORATE_STATES_GITHUB: ${{ secrets.STORATE_STATES_GITHUB }}
         STORATE_STATES_LINUXDO: ${{ secrets.STORATE_STATES_LINUXDO }}
         DEBUG: ${{ github.event_name == 'workflow_dispatch' && inputs.debug || vars.DEBUG || 'false' }}
@@ -126,24 +127,16 @@ jobs:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       run: |
-        # 列出 storage-states 目录文件
         if (Test-Path "storage-states") {
-          echo "📁 storage-states 目录内容:"
-          echo "绝对路径: $(Resolve-Path storage-states)"
-          echo ""
-          echo "所有文件:"
-          Get-ChildItem -Path storage-states -File | ForEach-Object { echo "  - $($_.Name)" }
-          echo ""
-          echo "详细信息:"
+          echo "storage-states directory: $(Resolve-Path storage-states)"
           Get-ChildItem -Path storage-states -File | Format-Table Name, Length, LastWriteTime -AutoSize
-          echo "文件总数: $((Get-ChildItem -Path storage-states -File).Count)"
+          echo "File count: $((Get-ChildItem -Path storage-states -File).Count)"
         } else {
-          echo "⚠️ storage-states 目录不存在"
+          echo "storage-states directory does not exist"
         }
-        # 执行签到
         uv run python -u main.py
 
-    - name: 保存登录状态缓存
+    - name: Save login state cache
       if: hashFiles('storage-states/*.json') != ''
       uses: actions/cache/save@v4
       with:
@@ -151,7 +144,7 @@ jobs:
           storage-states
         key: storage-state-${{ hashFiles('storage-states/*.json') }}
 
-    - name: 保存余额历史缓存
+    - name: Save balance history cache
       if: hashFiles('balance_hash.txt') != ''
       uses: actions/cache/save@v4
       with:
@@ -159,7 +152,7 @@ jobs:
           balance_hash.txt
         key: balance-hash-${{ hashFiles('balance_hash.txt') }}
 
-    - name: 保存日志
+    - name: Upload logs
       if: always()
       uses: actions/upload-artifact@v4
       with:
@@ -170,8 +163,8 @@ jobs:
         if-no-files-found: ignore
         retention-days: 7
 
-    - name: 执行结果
+    - name: Print result timestamp
       if: always()
       run: |
-        echo "签到任务执行完成"
-        echo "时间: $(Get-Date)"
+        echo "Check-in workflow completed"
+        echo "Time: $(Get-Date)"
