@@ -662,25 +662,47 @@ class CheckIn:
 
                     # Fetch user info from inside the browser session. This lets the site handle
                     # its own browser/WAF cookies without reverse-engineering them.
-                    response = await page.evaluate(
-                        """async ({ url, headers }) => {
-                           const response = await fetch(url, {
-                               method: 'GET',
-                               credentials: 'include',
-                               headers,
-                           });
-                           const text = await response.text();
-                           try {
-                               return JSON.parse(text);
-                           } catch (error) {
-                               return {
-                                   success: false,
-                                   message: `Invalid JSON response: HTTP ${response.status}`,
-                               };
-                           }
-                        }""",
-                        {"url": self.provider_config.get_user_info_url(), "headers": fetch_headers},
-                    )
+                    response = None
+                    for attempt in range(3):
+                        try:
+                            response = await page.evaluate(
+                                """async ({ url, headers }) => {
+                                   const response = await fetch(url, {
+                                       method: 'GET',
+                                       credentials: 'include',
+                                       headers,
+                                   });
+                                   const text = await response.text();
+                                   try {
+                                       return JSON.parse(text);
+                                   } catch (error) {
+                                       return {
+                                           success: false,
+                                           message: `Invalid JSON response: HTTP ${response.status}`,
+                                       };
+                                   }
+                                }""",
+                                {"url": self.provider_config.get_user_info_url(), "headers": fetch_headers},
+                            )
+                            break
+                        except Exception as eval_error:
+                            message = str(eval_error)
+                            navigation_race = (
+                                "Execution context was destroyed" in message
+                                or "navigation" in message.lower()
+                            )
+                            if not navigation_race or attempt == 2:
+                                raise
+
+                            print(
+                                f"ℹ️ {self.account_name}: Page navigated during user info fetch; "
+                                f"retrying ({attempt + 2}/3)"
+                            )
+                            try:
+                                await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                            except Exception:
+                                pass
+                            await page.wait_for_timeout(2000)
 
                     if response and "data" in response:
                         user_data = response.get("data", {})
