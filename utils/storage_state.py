@@ -38,6 +38,13 @@ def ensure_storage_state_from_env(
         return False
 
     storage_state_data = storage_states.get(username)
+    if storage_state_data is None and len(storage_states) == 1:
+        fallback_key, storage_state_data = next(iter(storage_states.items()))
+        print(
+            f"ℹ️ {account_name}: Storage state '{username}' was not found in {env_name}; "
+            f"using the only available entry '{fallback_key}'"
+        )
+
     if storage_state_data is None:
         print(f"⚠️ {account_name}: Skip restoring storage state because '{username}' was not found in {env_name}")
         return False
