@@ -1020,6 +1020,12 @@ class CheckIn:
 
     async def wait_for_clicked_check_in_response(self, page, check_in_url: str) -> dict | None:
         """Click the UI check-in button and parse the matching network response if present."""
+        if not hasattr(page, "wait_for_response"):
+            clicked = await self.click_browser_check_in_button(page)
+            if clicked:
+                await page.wait_for_timeout(5000)
+            return None
+
         check_in_path = urlparse(check_in_url).path
         response_task = asyncio.create_task(
             page.wait_for_response(
