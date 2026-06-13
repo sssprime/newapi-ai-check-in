@@ -57,6 +57,29 @@ class CheckIn:
 
         os.makedirs(self.storage_state_dir, exist_ok=True)
 
+    def should_use_browser_user_info(self) -> bool:
+        """Whether final user-info validation should run inside a browser session."""
+        return str(self.account_config.get("user_info_mode", "")).lower() == "browser"
+
+    def cookies_to_browser_format(self, cookies: dict | list[dict]) -> list[dict]:
+        """Convert simple cookie dicts into Camoufox/Playwright cookie objects."""
+        if isinstance(cookies, list):
+            return cookies
+
+        parsed_origin = urlparse(self.provider_config.origin)
+        domain = parsed_origin.hostname or parsed_origin.netloc
+        return [
+            {
+                "name": str(name),
+                "value": str(value),
+                "domain": domain,
+                "path": "/",
+                "secure": parsed_origin.scheme == "https",
+            }
+            for name, value in cookies.items()
+            if name and value is not None
+        ]
+
     async def get_waf_cookies_with_browser(self) -> dict | None:
         """使用 Camoufox 获取 WAF cookies（隐私模式）"""
         print(
@@ -587,7 +610,7 @@ class CheckIn:
                 "error": f"Failed to get auth state, {e}",
             }
 
-    async def get_user_info_with_browser(self, auth_cookies: list[dict]) -> dict:
+    async def get_user_info_with_browser(self, auth_cookies: list[dict] | dict, headers: dict | None = None) -> dict:
         """使用 Camoufox 获取用户信息
 
         Returns:
@@ -609,35 +632,54 @@ class CheckIn:
                 proxy=self.camoufox_proxy_config,
                 os="macos",  # 强制使用 macOS 指纹，避免跨平台指纹不一致问题
             ) as browser:
+                browser_cookies = self.cookies_to_browser_format(auth_cookies)
+                if browser_cookies:
+                    await browser.add_cookies(browser_cookies)
+                    print(f"ℹ️ {self.account_name}: Added {len(browser_cookies)} cookie(s) to browser context")
+
                 page = await browser.new_page()
 
-                browser.add_cookies(auth_cookies)
-
                 try:
-                    # 1. 打开登录页面
-                    print(f"ℹ️ {self.account_name}: Opening main page")
-                    await page.goto(self.provider_config.origin, wait_until="networkidle")
+                    # Open the site in the same browser context that will read user info.
+                    print(f"ℹ️ {self.account_name}: Opening login page")
+                    await page.goto(self.provider_config.get_login_url(), wait_until="domcontentloaded", timeout=45000)
 
-                    # 等待页面完全加载
                     try:
-                        await page.wait_for_function('document.readyState === "complete"', timeout=5000)
+                        await page.wait_for_load_state("networkidle", timeout=10000)
                     except Exception:
-                        await page.wait_for_timeout(3000)
+                        await page.wait_for_timeout(5000)
 
                     if self.provider_config.aliyun_captcha:
                         captcha_check = await aliyun_captcha_check(page, self.account_name)
                         if captcha_check:
                             await page.wait_for_timeout(3000)
 
-                    # 获取用户信息
+                    fetch_headers = {"Accept": "application/json, text/plain, */*"}
+                    if headers:
+                        for header_name in (self.provider_config.api_user_key, "Authorization", "X-Requested-With"):
+                            if headers.get(header_name):
+                                fetch_headers[header_name] = headers[header_name]
+
+                    # Fetch user info from inside the browser session. This lets the site handle
+                    # its own browser/WAF cookies without reverse-engineering them.
                     response = await page.evaluate(
-                        f"""async () => {{
-                           const response = await fetch(
-                               '{self.provider_config.get_user_info_url()}'
-                           );
-                           const data = await response.json();
-                           return data;
-                        }}"""
+                        """async ({ url, headers }) => {
+                           const response = await fetch(url, {
+                               method: 'GET',
+                               credentials: 'include',
+                               headers,
+                           });
+                           const text = await response.text();
+                           try {
+                               return JSON.parse(text);
+                           } catch (error) {
+                               return {
+                                   success: false,
+                                   message: `Invalid JSON response: HTTP ${response.status}`,
+                               };
+                           }
+                        }""",
+                        {"url": self.provider_config.get_user_info_url(), "headers": fetch_headers},
                     )
 
                     if response and "data" in response:
@@ -1016,7 +1058,10 @@ class CheckIn:
                     print(f"❌ {self.account_name}: Topup failed, stopping check-in process")
                     return False, {"error": error_msg}
 
-            user_info = await self.get_user_info(session, headers)
+            if self.should_use_browser_user_info():
+                user_info = await self.get_user_info_with_browser(cookies, headers)
+            else:
+                user_info = await self.get_user_info(session, headers)
             if user_info and user_info.get("success"):
                 success_msg = user_info.get("display", "User info retrieved successfully")
                 print(f"✅ {self.account_name}: {success_msg}")
@@ -1120,7 +1165,10 @@ class CheckIn:
                     print(f"❌ {self.account_name}: Topup failed, stopping check-in process")
                     return False, {"error": error_msg}
 
-            user_info = await self.get_user_info(session, headers)
+            if self.should_use_browser_user_info():
+                user_info = await self.get_user_info_with_browser(session.cookies.get_dict(), headers)
+            else:
+                user_info = await self.get_user_info(session, headers)
             if user_info and user_info.get("success"):
                 success_msg = user_info.get("display", "User info retrieved successfully")
                 print(f"✅ {self.account_name}: {success_msg}")
@@ -1837,7 +1885,11 @@ class CheckIn:
         bypass_cookies = {}
         browser_headers = None  # 浏览器指纹头部信息
         
-        if self.provider_config.needs_waf_cookies():
+        if self.should_use_browser_user_info() and (
+            self.provider_config.needs_waf_cookies() or self.provider_config.needs_cf_clearance()
+        ):
+            print(f"ℹ️ {self.account_name}: Browser user-info mode enabled; bypass will be handled in browser")
+        elif self.provider_config.needs_waf_cookies():
             waf_cookies = await self.get_waf_cookies_with_browser()
             if waf_cookies:
                 bypass_cookies = waf_cookies
