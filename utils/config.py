@@ -6,15 +6,14 @@
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Generator, AsyncGenerator, List, Literal
+from typing import AsyncGenerator, Callable, Dict, Generator, List, Literal
 
-from utils.get_check_in_status import newapi_check_in_status
 from utils.get_cdk import (
     get_runawaytime_cdk,
     get_x666_cdk,
     # get_b4u_cdk,
 )
-
+from utils.get_check_in_status import newapi_check_in_status
 
 # 前向声明 AccountConfig 类型，用于类型注解
 # 实际的 AccountConfig 类在后面定义
@@ -622,6 +621,44 @@ class AppConfig:
                 github_auth_path=None,
                 linuxdo_client_id="4OtAotK6cp4047lgPD4kPXNhWRbRdTw3",
                 linuxdo_auth_path="/api/oauth/linuxdo",
+                aliyun_captcha=False,
+                bypass_method=None,
+            ),
+            "x666_wheel": ProviderConfig(
+                name="x666_wheel",
+                origin="https://up.x666.me",
+                login_path="/",
+                status_path="/api/checkin/status",
+                auth_state_path="/api/auth/login",
+                check_in_path=None,
+                check_in_status=False,
+                user_info_path="/api/user/info",
+                topup_path=None,
+                get_cdk=None,
+                api_user_key="new-api-user",
+                github_client_id=None,
+                github_auth_path=None,
+                linuxdo_client_id=None,
+                linuxdo_auth_path=None,
+                aliyun_captcha=False,
+                bypass_method=None,
+            ),
+            "abrdns_checkin": ProviderConfig(
+                name="abrdns_checkin",
+                origin="https://checkin.new-api.abrdns.com",
+                login_path="/auth/linuxdo/login",
+                status_path="/",
+                auth_state_path="/auth/linuxdo/login",
+                check_in_path=None,
+                check_in_status=False,
+                user_info_path="/",
+                topup_path=None,
+                get_cdk=None,
+                api_user_key="new-api-user",
+                github_client_id=None,
+                github_auth_path=None,
+                linuxdo_client_id=None,
+                linuxdo_auth_path="/auth/linuxdo/login",
                 aliyun_captcha=False,
                 bypass_method=None,
             ),

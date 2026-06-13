@@ -13,19 +13,23 @@ from urllib.parse import urlencode, urlparse
 
 from camoufox.async_api import AsyncCamoufox
 from curl_cffi import requests as curl_requests
+from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
 
 from utils.browser_utils import (
     aliyun_captcha_check,
     filter_cookies,
     get_random_user_agent,
     parse_cookies,
+    save_page_content_to_file,
     take_screenshot,
 )
 from utils.config import AccountConfig, ProviderConfig
+from utils.get_cdk import get_x666_cdk
 from utils.get_cf_clearance import get_cf_clearance
 from utils.get_headers import get_browser_headers, get_curl_cffi_impersonate, print_browser_headers
 from utils.http_utils import proxy_resolve, response_resolve
 from utils.mask_utils import mask_username
+from utils.storage_state import ensure_storage_state_from_env
 from utils.topup import topup
 
 
@@ -68,6 +72,26 @@ class CheckIn:
     def should_use_browser_user_info(self) -> bool:
         """Whether final user-info validation should run inside a browser session."""
         return str(self.account_config.get("user_info_mode", "")).lower() == "browser"
+
+    def get_custom_flow_name(self) -> str:
+        """Return the optional standalone custom flow name for non-NewAPI check-ins."""
+        return str(self.account_config.get("custom_flow", "") or "").strip().lower()
+
+    def build_custom_flow_user_info(self, display: str) -> dict:
+        """Build a minimal user-info payload compatible with the main summary code."""
+        return {
+            "success": True,
+            "quota": 0,
+            "used_quota": 0,
+            "bonus_quota": 0,
+            "display": display,
+        }
+
+    def get_custom_flow_storage_path(self, flow_name: str, username: str) -> str:
+        """Return a stable storage-state path without exposing the username."""
+        username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
+        safe_flow_name = "".join(c if c.isalnum() else "_" for c in flow_name)
+        return os.path.join(self.storage_state_dir, f"{safe_flow_name}_{username_hash}.json")
 
     def get_check_in_mode(self) -> str:
         """Return the optional per-account check-in mode."""
@@ -2234,9 +2258,299 @@ class CheckIn:
                 await page.close()
                 await context.close()
 
+    async def execute_custom_flow(self) -> tuple[bool, dict]:
+        """Run a standalone non-NewAPI check-in flow configured by account.custom_flow."""
+        flow_name = self.get_custom_flow_name()
+        if flow_name in {"x666", "x666_wheel", "up_x666", "up.x666.me"}:
+            return await self.execute_x666_wheel_flow()
+        if flow_name in {"abrdns", "abrdns_checkin", "checkin_abrdns", "newapi_abrdns"}:
+            return await self.execute_abrdns_checkin_flow()
+        return False, {"error": f"Unsupported custom_flow: {flow_name}"}
+
+    async def execute_x666_wheel_flow(self) -> tuple[bool, dict]:
+        """Run the existing x666 wheel helper as a standalone account flow."""
+        try:
+            got_result = False
+            async for success, payload in get_x666_cdk(self.account_config):
+                got_result = True
+                payload = payload if isinstance(payload, dict) else {}
+                if not success:
+                    return False, {"error": payload.get("error", "x666 wheel check-in failed")}
+
+            if got_result:
+                return True, self.build_custom_flow_user_info("x666 wheel check-in completed")
+
+            return False, {"error": "x666 wheel helper returned no result"}
+        except Exception as e:
+            return False, {"error": f"x666 wheel custom flow error: {e}"}
+
+    def resolve_abrdns_checkin_response(self, response_data: dict | None) -> dict:
+        """Normalize the abrdns standalone check-in response."""
+        if not isinstance(response_data, dict):
+            return {"success": False, "error": "Invalid abrdns response", "status_code": 0}
+
+        status_code = int(response_data.get("status") or 0)
+        payload = response_data.get("payload")
+        text = str(response_data.get("text") or "")
+
+        message = text
+        if isinstance(payload, dict):
+            message_value = payload.get("message", payload.get("msg", payload.get("detail", payload.get("data", ""))))
+            if isinstance(message_value, (dict, list)):
+                message = json.dumps(message_value, ensure_ascii=False)
+            else:
+                message = str(message_value or text)
+
+        message_lower = message.lower()
+        already_keywords = ["already", "already checked", "already signed", "已签到", "已经签到", "重复签到", "今日已"]
+        success_keywords = ["success", "check-in successful", "checked in", "签到成功", "领取成功", "成功"]
+        is_already = any(keyword in message_lower or keyword in message for keyword in already_keywords)
+        is_success_message = any(keyword in message_lower or keyword in message for keyword in success_keywords)
+
+        explicit_success = isinstance(payload, dict) and (
+            payload.get("success") is True or payload.get("ok") is True or payload.get("code") == 0
+        )
+        implicit_success = (
+            status_code == 200
+            and isinstance(payload, dict)
+            and payload.get("success") is not False
+            and "error" not in payload
+            and "detail" not in payload
+        )
+
+        if explicit_success or is_already or is_success_message or implicit_success:
+            return {
+                "success": True,
+                "message": message or "abrdns check-in completed",
+                "status_code": status_code,
+            }
+
+        error = message or f"HTTP {status_code}"
+        return {
+            "success": False,
+            "error": error,
+            "status_code": status_code,
+            "requires_login": status_code == 401 or "登录" in message or "login" in message_lower,
+        }
+
+    async def post_abrdns_checkin(self, page) -> dict:
+        """POST the abrdns check-in form from the current browser session."""
+        response_data = await page.evaluate(
+            """async () => {
+                const response = await fetch('/checkin', {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                        'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: new URLSearchParams({'h-captcha-response': ''}).toString()
+                });
+                const text = await response.text();
+                let payload = null;
+                try {
+                    payload = JSON.parse(text);
+                } catch (error) {
+                    payload = null;
+                }
+                return {status: response.status, ok: response.ok, text, payload};
+            }"""
+        )
+        return self.resolve_abrdns_checkin_response(response_data)
+
+    async def solve_linuxdo_challenge_if_present(self, page, solver: ClickSolver) -> None:
+        """Best-effort Cloudflare challenge handling for Linux.do OAuth pages."""
+        try:
+            title = await page.title()
+            content = await page.content()
+            current_url = page.url
+            if "__cf_chl_rt_tk" not in current_url and "Just a moment" not in title and "Checking your browser" not in content:
+                return
+
+            print(f"ℹ️ {self.account_name}: Linux.do Cloudflare challenge detected, attempting auto-solve")
+            await solver.solve_captcha(captcha_container=page, captcha_type=CaptchaType.CLOUDFLARE_INTERSTITIAL)
+            await page.wait_for_timeout(10000)
+        except Exception as e:
+            print(f"⚠️ {self.account_name}: Linux.do challenge handling did not complete: {e}")
+
+    async def submit_linuxdo_login_form(self, page, username: str, password: str) -> dict:
+        """Fill the Linux.do login form without writing credentials to logs."""
+        if os.getenv("RUN_LINUXDO_LOGIN_MANUAL") != "true":
+            return {"success": False, "error": "Linux.do manual login is disabled"}
+
+        try:
+            await page.wait_for_selector("#login-account-name", timeout=20000)
+            await page.fill("#login-account-name", username)
+            await page.wait_for_timeout(1000)
+            await page.fill("#login-account-password", password)
+            await page.wait_for_timeout(1000)
+            await page.click("#login-button")
+            await page.wait_for_timeout(10000)
+            await save_page_content_to_file(page, "abrdns_linuxdo_login_result", self.account_name, prefix="abrdns")
+            return {"success": True}
+        except Exception as e:
+            await take_screenshot(page, "abrdns_linuxdo_login_failed", self.account_name)
+            return {"success": False, "error": f"Linux.do login form failed: {e}"}
+
+    async def click_linuxdo_approve_button(self, page) -> bool:
+        """Click the Linux.do OAuth approve button if it is visible."""
+        selectors = [
+            'a[href^="/oauth2/approve"]',
+            'button:has-text("Authorize")',
+            'button:has-text("Allow")',
+            'button:has-text("允许")',
+            'button:has-text("授权")',
+            'input[type="submit"]',
+        ]
+
+        for selector in selectors:
+            try:
+                locator = page.locator(selector).first()
+                if await locator.count() > 0:
+                    await locator.click(timeout=5000)
+                    return True
+            except Exception:
+                continue
+
+        return False
+
+    async def perform_abrdns_linuxdo_oauth(self, page, username: str, password: str, cache_file_path: str) -> dict:
+        """Log in to checkin.new-api.abrdns.com through its own Linux.do OAuth entrypoint."""
+        login_url = f"{self.provider_config.origin}/auth/linuxdo/login"
+
+        async with ClickSolver(framework=FrameworkType.CAMOUFOX, page=page, max_attempts=5, attempt_delay=3) as solver:
+            try:
+                await page.goto(login_url, wait_until="domcontentloaded", timeout=45000)
+                await page.wait_for_timeout(3000)
+                await self.solve_linuxdo_challenge_if_present(page, solver)
+
+                if page.url.startswith(self.provider_config.origin):
+                    await page.context.storage_state(path=cache_file_path)
+                    return {"success": True}
+
+                if await page.query_selector("#login-account-name"):
+                    login_result = await self.submit_linuxdo_login_form(page, username, password)
+                    if not login_result.get("success"):
+                        return login_result
+                    await self.solve_linuxdo_challenge_if_present(page, solver)
+                    await page.goto(login_url, wait_until="domcontentloaded", timeout=45000)
+                    await page.wait_for_timeout(3000)
+
+                if not page.url.startswith(self.provider_config.origin):
+                    clicked = await self.click_linuxdo_approve_button(page)
+                    if not clicked:
+                        await page.goto(login_url, wait_until="domcontentloaded", timeout=45000)
+                        await page.wait_for_timeout(3000)
+                        await self.solve_linuxdo_challenge_if_present(page, solver)
+
+                        if await page.query_selector("#login-account-name"):
+                            login_result = await self.submit_linuxdo_login_form(page, username, password)
+                            if not login_result.get("success"):
+                                return login_result
+                            await page.goto(login_url, wait_until="domcontentloaded", timeout=45000)
+                            await page.wait_for_timeout(3000)
+
+                        clicked = await self.click_linuxdo_approve_button(page)
+                        if not clicked and not page.url.startswith(self.provider_config.origin):
+                            await take_screenshot(page, "abrdns_linuxdo_approve_not_found", self.account_name)
+                            return {"success": False, "error": "Linux.do approve button not found"}
+
+                try:
+                    await page.wait_for_url(f"{self.provider_config.origin}/**", timeout=30000)
+                except Exception:
+                    if not page.url.startswith(self.provider_config.origin):
+                        await take_screenshot(page, "abrdns_oauth_redirect_failed", self.account_name)
+                        return {"success": False, "error": "abrdns OAuth redirect did not complete"}
+
+                await page.context.storage_state(path=cache_file_path)
+                return {"success": True}
+            except Exception as e:
+                await take_screenshot(page, "abrdns_oauth_error", self.account_name)
+                return {"success": False, "error": f"abrdns OAuth error: {e}"}
+
+    async def execute_abrdns_checkin_flow(self) -> tuple[bool, dict]:
+        """Run checkin.new-api.abrdns.com check-in via Linux.do OAuth session."""
+        linuxdo_accounts = self.account_config.linux_do
+        if not linuxdo_accounts:
+            return False, {"error": "abrdns custom flow requires linux.do account config"}
+
+        linuxdo_account = linuxdo_accounts[0]
+        if not linuxdo_account.username or not linuxdo_account.password:
+            return False, {"error": "Incomplete Linux.do account information"}
+
+        cache_file_path = self.get_custom_flow_storage_path("abrdns", linuxdo_account.username)
+        ensure_storage_state_from_env(
+            cache_file_path,
+            self.account_name,
+            linuxdo_account.username,
+            env_name="STORATE_STATES_LINUXDO",
+        )
+
+        async with AsyncCamoufox(
+            headless=False,
+            humanize=True,
+            locale="en-US",
+            geoip=True if self.camoufox_proxy_config else False,
+            proxy=self.camoufox_proxy_config,
+            os="macos",
+        ) as browser:
+            storage_state = cache_file_path if os.path.exists(cache_file_path) else None
+            if storage_state:
+                print(f"ℹ️ {self.account_name}: Found abrdns cache file, restoring storage state")
+            else:
+                print(f"ℹ️ {self.account_name}: No abrdns cache file found, starting fresh")
+
+            context = await browser.new_context(storage_state=storage_state)
+            page = await context.new_page()
+            try:
+                await page.goto(f"{self.provider_config.origin}/", wait_until="domcontentloaded", timeout=45000)
+                await page.wait_for_timeout(1500)
+
+                first_result = await self.post_abrdns_checkin(page)
+                if first_result.get("success"):
+                    await context.storage_state(path=cache_file_path)
+                    return True, self.build_custom_flow_user_info(
+                        f"abrdns check-in completed: {first_result.get('message', '')}".strip()
+                    )
+
+                if first_result.get("requires_login"):
+                    print(f"ℹ️ {self.account_name}: abrdns session is not logged in, starting Linux.do OAuth")
+                else:
+                    print(f"⚠️ {self.account_name}: abrdns first check-in attempt failed, refreshing OAuth session")
+
+                login_result = await self.perform_abrdns_linuxdo_oauth(
+                    page,
+                    linuxdo_account.username,
+                    linuxdo_account.password,
+                    cache_file_path,
+                )
+                if not login_result.get("success"):
+                    return False, {"error": login_result.get("error", "abrdns Linux.do OAuth failed")}
+
+                final_result = await self.post_abrdns_checkin(page)
+                if final_result.get("success"):
+                    await context.storage_state(path=cache_file_path)
+                    return True, self.build_custom_flow_user_info(
+                        f"abrdns check-in completed: {final_result.get('message', '')}".strip()
+                    )
+
+                return False, {"error": final_result.get("error", "abrdns check-in failed")}
+            except Exception as e:
+                await take_screenshot(page, "abrdns_custom_flow_error", self.account_name)
+                return False, {"error": f"abrdns custom flow error: {e}"}
+            finally:
+                await page.close()
+                await context.close()
+
     async def execute(self) -> list[tuple[str, bool, dict | None]]:
         """为单个账号执行签到操作，支持多种认证方式"""
         print(f"\n\n⏳ Starting to process {self.account_name}")
+
+        custom_flow_name = self.get_custom_flow_name()
+        if custom_flow_name:
+            print(f"ℹ️ {self.account_name}: Running custom flow '{custom_flow_name}'")
+            success, user_info = await self.execute_custom_flow()
+            return [(custom_flow_name, success, user_info)]
 
         bypass_cookies = {}
         browser_headers = None  # 浏览器指纹头部信息
