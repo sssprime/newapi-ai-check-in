@@ -4,22 +4,30 @@ CheckIn 类
 """
 
 import asyncio
-import json
-import inspect
 import hashlib
+import inspect
+import json
 import os
 import tempfile
-from urllib.parse import urlparse, urlencode
+from urllib.parse import urlencode, urlparse
 
-from curl_cffi import requests as curl_requests
 from camoufox.async_api import AsyncCamoufox
+from curl_cffi import requests as curl_requests
+
+from utils.browser_utils import (
+    aliyun_captcha_check,
+    filter_cookies,
+    get_random_user_agent,
+    parse_cookies,
+    take_screenshot,
+)
 from utils.config import AccountConfig, ProviderConfig
-from utils.browser_utils import parse_cookies, filter_cookies, get_random_user_agent, take_screenshot, aliyun_captcha_check
 from utils.get_cf_clearance import get_cf_clearance
-from utils.http_utils import proxy_resolve, response_resolve
-from utils.topup import topup
 from utils.get_headers import get_browser_headers, get_curl_cffi_impersonate, print_browser_headers
+from utils.http_utils import proxy_resolve, response_resolve
 from utils.mask_utils import mask_username
+from utils.topup import topup
+
 
 class CheckIn:
     """newapi.ai 签到管理类"""
@@ -60,6 +68,43 @@ class CheckIn:
     def should_use_browser_user_info(self) -> bool:
         """Whether final user-info validation should run inside a browser session."""
         return str(self.account_config.get("user_info_mode", "")).lower() == "browser"
+
+    def get_check_in_mode(self) -> str:
+        """Return the optional per-account check-in mode."""
+        mode = self.account_config.get("check_in_mode", self.account_config.get("browser_check_in_mode", ""))
+        return str(mode or "").strip().lower()
+
+    def should_use_browser_check_in_first(self) -> bool:
+        """Whether check-in should be attempted in a browser page before HTTP."""
+        return self.get_check_in_mode() in {"browser", "browser_page", "page"}
+
+    def should_retry_browser_check_in(self, check_in_result: dict | None) -> bool:
+        """Whether a failed HTTP check-in should be retried inside a browser page."""
+        mode = self.get_check_in_mode()
+        if mode in {"auto_browser", "browser_fallback", "browser_retry", "browser", "browser_page", "page"}:
+            return True
+
+        if not self.account_config.get("browser_check_in_on_error", False):
+            return False
+
+        error_text = ""
+        if check_in_result:
+            error_text = str(check_in_result.get("error") or check_in_result.get("message") or "")
+
+        markers = [
+            "turnstile",
+            "cloudflare",
+            "just a moment",
+            "invalid response format",
+            "signature",
+            "integrity",
+            "\u7f3a\u5c11\u7b7e\u5230\u7b7e\u540d",
+            "\u7b7e\u5230\u7b7e\u540d\u8bf7\u6c42\u5934",
+            "\u5b8c\u6574\u6027\u6807\u8bb0",
+            "\u9a8c\u8bc1",
+        ]
+        normalized = error_text.lower()
+        return any(marker in normalized for marker in markers)
 
     def cookies_to_browser_format(self, cookies: dict | list[dict]) -> list[dict]:
         """Convert simple cookie dicts into Camoufox/Playwright cookie objects."""
@@ -860,6 +905,281 @@ class CheckIn:
             print(f"❌ {self.account_name}: Check-in failed - HTTP {response.status_code}")
             return {"success": False, "error": f"HTTP {response.status_code}"}
 
+    def resolve_check_in_payload(self, payload: dict, status_code: int = 200) -> dict:
+        """Normalize a NewAPI-style check-in JSON payload."""
+        if not isinstance(payload, dict):
+            return {"success": False, "error": f"Invalid JSON payload type: {type(payload).__name__}"}
+
+        message = payload.get("message", payload.get("msg", payload.get("data", "")))
+        if isinstance(message, (dict, list)):
+            message_text = json.dumps(message, ensure_ascii=False)
+        else:
+            message_text = str(message or "")
+
+        already_keywords = [
+            "already",
+            "already checked",
+            "already signed",
+            "\u5df2\u7b7e\u5230",
+            "\u5df2\u7ecf\u7b7e\u5230",
+            "\u91cd\u590d\u7b7e\u5230",
+        ]
+        success = (
+            payload.get("ret") == 1
+            or payload.get("code") == 0
+            or payload.get("success") is True
+            or any(keyword in message_text.lower() for keyword in already_keywords)
+            or "\u7b7e\u5230\u6210\u529f" in message_text
+        )
+
+        if success:
+            check_in_data = payload.get("data", {})
+            if not isinstance(check_in_data, dict):
+                check_in_data = {"raw": check_in_data}
+            return {
+                "success": True,
+                "message": message_text or "Check-in successful",
+                "data": check_in_data,
+                "status_code": status_code,
+            }
+
+        error_msg = payload.get("msg", payload.get("message", "Unknown error"))
+        if isinstance(error_msg, (dict, list)):
+            error_msg = json.dumps(error_msg, ensure_ascii=False)
+        return {"success": False, "error": str(error_msg), "status_code": status_code}
+
+    def resolve_check_in_text_response(self, status_code: int, text: str) -> dict:
+        """Normalize a browser fetch response body from the check-in endpoint."""
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            if "success" in text.lower():
+                return {"success": True, "message": "Check-in successful", "status_code": status_code}
+            snippet = text[:200].replace("\n", " ").replace("\r", " ")
+            return {
+                "success": False,
+                "error": f"Invalid response format: HTTP {status_code} {snippet}",
+                "status_code": status_code,
+            }
+
+        return self.resolve_check_in_payload(payload, status_code)
+
+    def get_browser_check_in_page_url(self) -> str:
+        """Resolve the page that should be opened before page-context check-in."""
+        configured_url = self.account_config.get("check_in_page_url")
+        if configured_url:
+            configured_url = str(configured_url)
+            if configured_url.startswith(("http://", "https://")):
+                return configured_url
+            return f"{self.provider_config.origin}{configured_url if configured_url.startswith('/') else '/' + configured_url}"
+
+        configured_path = self.account_config.get("check_in_page_path", "/console")
+        if not configured_path:
+            configured_path = self.provider_config.login_path
+        configured_path = str(configured_path)
+        return f"{self.provider_config.origin}{configured_path if configured_path.startswith('/') else '/' + configured_path}"
+
+    def build_browser_check_in_headers(self, headers: dict, api_user: str | int) -> dict:
+        """Build script-settable headers for in-page fetch."""
+        fetch_headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+            self.provider_config.api_user_key: f"{api_user}",
+        }
+        if headers.get("Authorization"):
+            fetch_headers["Authorization"] = headers["Authorization"]
+        return fetch_headers
+
+    async def click_browser_check_in_button(self, page) -> bool:
+        """Click a likely check-in button if the current page renders one."""
+        try:
+            clicked = await page.evaluate(
+                """() => {
+                    const keywords = ['签到', '簽到', 'check in', 'check-in', 'daily check'];
+                    const nodes = Array.from(document.querySelectorAll(
+                        'button, a, [role="button"], input[type="button"], input[type="submit"]'
+                    ));
+                    for (const node of nodes) {
+                        const text = `${node.innerText || node.textContent || node.value || ''}`.trim().toLowerCase();
+                        if (!text) continue;
+                        if (keywords.some((keyword) => text.includes(keyword.toLowerCase()))) {
+                            node.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }"""
+            )
+            if clicked:
+                print(f"ℹ️ {self.account_name}: Clicked a check-in button in browser page")
+            return bool(clicked)
+        except Exception as e:
+            print(f"⚠️ {self.account_name}: Browser check-in button click failed: {e}")
+            return False
+
+    async def wait_for_clicked_check_in_response(self, page, check_in_url: str) -> dict | None:
+        """Click the UI check-in button and parse the matching network response if present."""
+        check_in_path = urlparse(check_in_url).path
+        response_task = asyncio.create_task(
+            page.wait_for_response(
+                lambda response: urlparse(response.url).path == check_in_path
+                and response.request.method.upper() == "POST",
+                timeout=15000,
+            )
+        )
+
+        clicked = await self.click_browser_check_in_button(page)
+        if not clicked:
+            response_task.cancel()
+            return None
+
+        try:
+            response = await response_task
+            text = await response.text()
+            result = self.resolve_check_in_text_response(response.status, text)
+            print(f"ℹ️ {self.account_name}: Browser click check-in response HTTP {response.status}")
+            return result
+        except Exception as e:
+            if not response_task.done():
+                response_task.cancel()
+            print(f"⚠️ {self.account_name}: No usable check-in response after browser click: {e}")
+            return None
+
+    async def execute_check_in_with_browser(
+        self,
+        auth_cookies: dict | list[dict],
+        headers: dict,
+        api_user: str | int,
+    ) -> dict:
+        """Execute check-in from inside a real browser page context."""
+        check_in_url = self.provider_config.get_check_in_url(api_user)
+        if not check_in_url:
+            print(f"❌ {self.account_name}: No check-in URL configured")
+            return {"success": False, "error": "No check-in URL configured"}
+
+        page_url = self.get_browser_check_in_page_url()
+        print(
+            f"ℹ️ {self.account_name}: Starting browser page check-in "
+            f"(using proxy: {'true' if self.camoufox_proxy_config else 'false'})"
+        )
+
+        with tempfile.TemporaryDirectory(prefix=f"camoufox_{self.safe_account_name}_check_in_") as tmp_dir:
+            async with AsyncCamoufox(
+                user_data_dir=tmp_dir,
+                persistent_context=True,
+                headless=False,
+                humanize=True,
+                locale="en-US",
+                geoip=True if self.camoufox_proxy_config else False,
+                proxy=self.camoufox_proxy_config,
+                os="macos",
+            ) as browser:
+                browser_cookies = self.cookies_to_browser_format(auth_cookies)
+                if browser_cookies:
+                    await browser.add_cookies(browser_cookies)
+                    print(f"ℹ️ {self.account_name}: Added {len(browser_cookies)} cookie(s) to browser context")
+
+                page = await browser.new_page()
+                try:
+                    try:
+                        await page.goto(page_url, wait_until="domcontentloaded", timeout=45000)
+                    except Exception as first_error:
+                        print(f"⚠️ {self.account_name}: Failed to open {page_url}: {first_error}")
+                        await page.goto(self.provider_config.get_login_url(), wait_until="domcontentloaded", timeout=45000)
+
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=10000)
+                    except Exception:
+                        await page.wait_for_timeout(5000)
+
+                    if self.provider_config.aliyun_captcha:
+                        captcha_check = await aliyun_captcha_check(page, self.account_name)
+                        if captcha_check:
+                            await page.wait_for_timeout(3000)
+
+                    if self.account_config.get("browser_check_in_click", False):
+                        click_result = await self.wait_for_clicked_check_in_response(page, check_in_url)
+                        if click_result and click_result.get("success"):
+                            return click_result
+
+                    fetch_headers = self.build_browser_check_in_headers(headers, api_user)
+                    response = None
+                    for attempt in range(3):
+                        try:
+                            response = await page.evaluate(
+                                """async ({ url, headers }) => {
+                                    const response = await fetch(url, {
+                                        method: 'POST',
+                                        credentials: 'include',
+                                        headers,
+                                    });
+                                    const text = await response.text();
+                                    return { status: response.status, text };
+                                }""",
+                                {"url": check_in_url, "headers": fetch_headers},
+                            )
+                            break
+                        except Exception as eval_error:
+                            message = str(eval_error)
+                            navigation_race = (
+                                "Execution context was destroyed" in message
+                                or "navigation" in message.lower()
+                            )
+                            if not navigation_race or attempt == 2:
+                                raise
+                            print(
+                                f"ℹ️ {self.account_name}: Page navigated during browser check-in; "
+                                f"retrying ({attempt + 2}/3)"
+                            )
+                            try:
+                                await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                            except Exception:
+                                pass
+                            await page.wait_for_timeout(2000)
+
+                    result = self.resolve_check_in_text_response(response.get("status", 0), response.get("text", ""))
+                    if result.get("success"):
+                        print(f"✅ {self.account_name}: Browser page check-in successful")
+                    else:
+                        print(f"❌ {self.account_name}: Browser page check-in failed - {result.get('error')}")
+                    return result
+                except Exception as e:
+                    print(f"❌ {self.account_name}: Browser page check-in failed - {e}")
+                    await take_screenshot(page, "browser_check_in_error", self.account_name)
+                    return {"success": False, "error": f"Browser page check-in failed: {e}"}
+                finally:
+                    await page.close()
+
+    async def execute_check_in_with_optional_browser(
+        self,
+        session: curl_requests.Session,
+        headers: dict,
+        api_user: str | int,
+        auth_cookies: dict | list[dict],
+    ) -> dict:
+        """Run the configured check-in path with optional browser-page fallback."""
+        if self.should_use_browser_check_in_first():
+            browser_result = await self.execute_check_in_with_browser(auth_cookies, headers, api_user)
+            if browser_result.get("success") or not self.account_config.get("browser_check_in_fallback_http", True):
+                return browser_result
+            print(f"⚠️ {self.account_name}: Browser check-in failed; trying HTTP check-in")
+
+        check_in_result = self.execute_check_in(session, headers, api_user)
+        if check_in_result.get("success"):
+            return check_in_result
+
+        if self.should_retry_browser_check_in(check_in_result):
+            print(f"ℹ️ {self.account_name}: Retrying failed check-in in browser page")
+            browser_result = await self.execute_check_in_with_browser(auth_cookies, headers, api_user)
+            if browser_result.get("success"):
+                return browser_result
+            browser_error = browser_result.get("error", "Browser page check-in failed")
+            http_error = check_in_result.get("error", "HTTP check-in failed")
+            return {"success": False, "error": f"{http_error}; browser fallback: {browser_error}"}
+
+        return check_in_result
+
     async def execute_topup(
         self,
         headers: dict,
@@ -1048,7 +1368,9 @@ class CheckIn:
                         print(f"ℹ️ {self.account_name}: Already checked in today, skipping check-in")
                     else:
                         # 未签到，执行签到
-                        check_in_result = self.execute_check_in(session, headers, api_user)
+                        check_in_result = await self.execute_check_in_with_optional_browser(
+                            session, headers, api_user, cookies
+                        )
                         if not check_in_result.get("success"):
                             return False, {"error": check_in_result.get("error", "Check-in failed")}
                         # 签到成功后再次查询状态（显示最新状态）
@@ -1060,7 +1382,9 @@ class CheckIn:
                         )
                 else:
                     # 没有配置签到状态查询函数，直接执行签到
-                    check_in_result = self.execute_check_in(session, headers, api_user)
+                    check_in_result = await self.execute_check_in_with_optional_browser(
+                        session, headers, api_user, cookies
+                    )
                     if not check_in_result.get("success"):
                         return False, {"error": check_in_result.get("error", "Check-in failed")}
             else:
@@ -1155,7 +1479,9 @@ class CheckIn:
                         print(f"ℹ️ {self.account_name}: Already checked in today, skipping check-in")
                     else:
                         # 未签到，执行签到
-                        check_in_result = self.execute_check_in(session, headers, api_user)
+                        check_in_result = await self.execute_check_in_with_optional_browser(
+                            session, headers, api_user, session.cookies.get_dict()
+                        )
                         if not check_in_result.get("success"):
                             return False, {"error": check_in_result.get("error", "Check-in failed")}
                         # 签到成功后再次查询状态（显示最新状态）
@@ -1167,7 +1493,9 @@ class CheckIn:
                         )
                 else:
                     # 没有配置签到状态查询函数，直接执行签到
-                    check_in_result = self.execute_check_in(session, headers, api_user)
+                    check_in_result = await self.execute_check_in_with_optional_browser(
+                        session, headers, api_user, session.cookies.get_dict()
+                    )
                     if not check_in_result.get("success"):
                         return False, {"error": check_in_result.get("error", "Check-in failed")}
             else:
