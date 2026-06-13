@@ -352,6 +352,13 @@ async def _get_x666_user_token(
                 # Step 3: 导航到 connect.linux.do 授权页面
                 await page.goto(auth_result, wait_until="domcontentloaded")
                 await page.wait_for_timeout(3000)
+                if "Too Many Requests" in await page.content():
+                    print(
+                        f"ERROR {account_name}: Linux.do returned Too Many Requests; "
+                        "configure STORATE_STATES_LINUXDO or PROXY"
+                    )
+                    await take_screenshot(page, "x666_linuxdo_rate_limited", account_name)
+                    return None
 
                 current_url = page.url
 
@@ -372,6 +379,13 @@ async def _get_x666_user_token(
                             if "/login" not in current_url:
                                 await page.goto("https://linux.do/login", wait_until="domcontentloaded")
                                 await page.wait_for_timeout(3000)
+                                if "Too Many Requests" in await page.content():
+                                    print(
+                                        f"ERROR {account_name}: Linux.do returned Too Many Requests; "
+                                        "configure STORATE_STATES_LINUXDO or PROXY"
+                                    )
+                                    await take_screenshot(page, "x666_linuxdo_rate_limited", account_name)
+                                    return None
 
                             await page.fill("#login-account-name", username)
                             await page.wait_for_timeout(2000)

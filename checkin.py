@@ -2373,6 +2373,15 @@ class CheckIn:
         except Exception as e:
             print(f"⚠️ {self.account_name}: Linux.do challenge handling did not complete: {e}")
 
+    async def is_linuxdo_rate_limited(self, page) -> bool:
+        """Return whether Linux.do is showing a rate-limit page."""
+        try:
+            title = await page.title()
+            content = await page.content()
+            return "Too Many Requests" in title or "Too Many Requests" in content
+        except Exception:
+            return False
+
     async def submit_linuxdo_login_form(self, page, username: str, password: str) -> dict:
         """Fill the Linux.do login form without writing credentials to logs."""
         if os.getenv("RUN_LINUXDO_LOGIN_MANUAL") != "true":
@@ -2422,6 +2431,11 @@ class CheckIn:
             try:
                 await page.goto(login_url, wait_until="domcontentloaded", timeout=45000)
                 await page.wait_for_timeout(3000)
+                if await self.is_linuxdo_rate_limited(page):
+                    return {
+                        "success": False,
+                        "error": "Linux.do returned Too Many Requests; configure STORATE_STATES_LINUXDO or PROXY",
+                    }
                 await self.solve_linuxdo_challenge_if_present(page, solver)
 
                 if page.url.startswith(self.provider_config.origin):
@@ -2441,6 +2455,11 @@ class CheckIn:
                     if not clicked:
                         await page.goto(login_url, wait_until="domcontentloaded", timeout=45000)
                         await page.wait_for_timeout(3000)
+                        if await self.is_linuxdo_rate_limited(page):
+                            return {
+                                "success": False,
+                                "error": "Linux.do returned Too Many Requests; configure STORATE_STATES_LINUXDO or PROXY",
+                            }
                         await self.solve_linuxdo_challenge_if_present(page, solver)
 
                         if await page.query_selector("#login-account-name"):
