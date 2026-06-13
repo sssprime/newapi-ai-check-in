@@ -1,8 +1,8 @@
 name: newapi.ai 自动签到
 on:
   schedule:
-    # Runs daily at 01:30 China Standard Time (17:30 UTC).
-    - cron: '30 17 * * *'
+    # Runs daily at 00:30 China Standard Time (16:30 UTC).
+    - cron: '30 16 * * *'
   workflow_dispatch:
     inputs:
       accounts:
