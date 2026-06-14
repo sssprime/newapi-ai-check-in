@@ -2651,17 +2651,16 @@ class CheckIn:
         bypass_cookies = {}
         browser_headers = None  # 浏览器指纹头部信息
         
-        if self.should_use_browser_user_info() and (
-            self.provider_config.needs_waf_cookies() or self.provider_config.needs_cf_clearance()
-        ):
-            print(f"ℹ️ {self.account_name}: Browser user-info mode enabled; bypass will be handled in browser")
-        elif self.provider_config.needs_waf_cookies():
+        if self.provider_config.needs_waf_cookies():
             waf_cookies = await self.get_waf_cookies_with_browser()
             if waf_cookies:
                 bypass_cookies = waf_cookies
                 print(f"✅ {self.account_name}: WAF cookies obtained")
             else:
                 print(f"⚠️ {self.account_name}: Unable to get WAF cookies, continuing with empty cookies")
+
+        elif self.should_use_browser_user_info() and self.provider_config.needs_cf_clearance():
+            print(f"ℹ️ {self.account_name}: Browser user-info mode enabled; bypass will be handled in browser")
 
         elif self.provider_config.needs_cf_clearance():
             # 直接调用公共模块的 get_cf_clearance 函数
