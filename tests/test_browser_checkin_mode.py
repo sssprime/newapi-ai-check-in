@@ -40,6 +40,23 @@ def test_browser_page_mode_runs_browser_first():
 	assert checkin.should_retry_browser_check_in({"error": "any failure"})
 
 
+def test_browser_user_info_headers_use_single_canonical_new_api_user():
+	checkin = make_checkin()
+
+	headers = checkin.build_browser_user_info_headers(
+		{
+			"new-api-user": "174636",
+			"Authorization": "Bearer test",
+			"X-Requested-With": "XMLHttpRequest",
+		}
+	)
+
+	assert headers["New-Api-User"] == "174636"
+	assert "new-api-user" not in headers
+	assert headers["Authorization"] == "Bearer test"
+	assert headers["X-Requested-With"] == "XMLHttpRequest"
+
+
 def test_resolve_checkin_payload_success_and_already_checked():
 	checkin = make_checkin()
 

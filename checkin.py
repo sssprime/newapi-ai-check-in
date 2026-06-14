@@ -75,6 +75,30 @@ class CheckIn:
         """Whether final user-info validation should run inside a browser session."""
         return str(self.account_config.get("user_info_mode", "")).lower() == "browser"
 
+    def build_browser_user_info_headers(self, headers: dict | None = None) -> dict:
+        """Build fetch headers for browser user-info requests without duplicate API-user names."""
+        fetch_headers = {"Accept": "application/json, text/plain, */*"}
+        if not headers:
+            return fetch_headers
+
+        api_user_key = self.provider_config.api_user_key
+        api_user_value = (
+            headers.get(api_user_key)
+            or headers.get("New-Api-User")
+            or headers.get("new-api-user")
+        )
+        if api_user_value:
+            if api_user_key.lower() == "new-api-user":
+                fetch_headers["New-Api-User"] = str(api_user_value)
+            else:
+                fetch_headers[api_user_key] = str(api_user_value)
+
+        for header_name in ("Authorization", "X-Requested-With"):
+            if headers.get(header_name):
+                fetch_headers[header_name] = headers[header_name]
+
+        return fetch_headers
+
     def get_custom_flow_name(self) -> str:
         """Return the optional standalone custom flow name for non-NewAPI check-ins."""
         return str(self.account_config.get("custom_flow", "") or "").strip().lower()
@@ -725,14 +749,7 @@ class CheckIn:
                         if captcha_check:
                             await page.wait_for_timeout(3000)
 
-                    fetch_headers = {"Accept": "application/json, text/plain, */*"}
-                    if headers:
-                        for header_name in (self.provider_config.api_user_key, "Authorization", "X-Requested-With"):
-                            if headers.get(header_name):
-                                fetch_headers[header_name] = headers[header_name]
-                        api_user_value = headers.get(self.provider_config.api_user_key)
-                        if api_user_value and self.provider_config.api_user_key.lower() == "new-api-user":
-                            fetch_headers["New-Api-User"] = api_user_value
+                    fetch_headers = self.build_browser_user_info_headers(headers)
 
                     # Fetch user info from inside the browser session. This lets the site handle
                     # its own browser/WAF cookies without reverse-engineering them.
