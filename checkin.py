@@ -780,6 +780,52 @@ class CheckIn:
                                 pass
                             await page.wait_for_timeout(2000)
 
+                    if response and "data" not in response:
+                        response_text = f"{response.get('contentType', '')} {response.get('textPrefix', '')}".lower()
+                        if "aliyun_waf" in response_text or "aliyun" in response_text:
+                            print(f"ℹ️ {self.account_name}: Aliyun WAF HTML returned from user info fetch; probing in page")
+                            try:
+                                await page.set_extra_http_headers(fetch_headers)
+                                await page.goto(
+                                    self.provider_config.get_user_info_url(),
+                                    wait_until="domcontentloaded",
+                                    timeout=45000,
+                                )
+                                await page.wait_for_timeout(5000)
+                                body_text = await page.locator("body").inner_text(timeout=10000)
+                                try:
+                                    response = json.loads(body_text)
+                                except json.JSONDecodeError:
+                                    await page.goto(
+                                        self.provider_config.get_login_url(),
+                                        wait_until="domcontentloaded",
+                                        timeout=45000,
+                                    )
+                                    await page.wait_for_timeout(3000)
+                                    response = await page.evaluate(
+                                        """async ({ url, headers }) => {
+                                           const response = await fetch(url, {
+                                               method: 'GET',
+                                               credentials: 'include',
+                                               headers,
+                                           });
+                                           const text = await response.text();
+                                           try {
+                                               return JSON.parse(text);
+                                           } catch (error) {
+                                               return {
+                                                   success: false,
+                                                   message: `Invalid JSON response after WAF probe: HTTP ${response.status}`,
+                                                   contentType: response.headers.get('content-type') || '',
+                                                   textPrefix: text.slice(0, 120),
+                                               };
+                                           }
+                                        }""",
+                                        {"url": self.provider_config.get_user_info_url(), "headers": fetch_headers},
+                                    )
+                            except Exception as waf_error:
+                                print(f"⚠️ {self.account_name}: Aliyun WAF probe failed: {waf_error}")
+
                     if response and "data" in response:
                         user_data = response.get("data", {})
                         quota = round(user_data.get("quota", 0) / 500000, 2)
