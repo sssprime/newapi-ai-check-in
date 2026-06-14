@@ -1,8 +1,8 @@
 name: newapi.ai check-in
 on:
   schedule:
-    # Runs daily at 00:30 China Standard Time (16:30 UTC).
-    - cron: '30 16 * * *'
+    # Runs every 8 hours, matching the upstream project.
+    - cron: '0 */8 * * *'
   workflow_dispatch:
     inputs:
       accounts:
