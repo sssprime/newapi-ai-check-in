@@ -4,6 +4,7 @@ CheckIn 类
 """
 
 import asyncio
+import base64
 import hashlib
 import html
 import inspect
@@ -11,6 +12,9 @@ import json
 import os
 import re
 import tempfile
+import time
+import uuid
+from datetime import datetime
 from urllib.parse import urlencode, urlparse
 
 from camoufox.async_api import AsyncCamoufox
@@ -98,6 +102,200 @@ class CheckIn:
                 fetch_headers[header_name] = headers[header_name]
 
         return fetch_headers
+
+    def get_check_in_header_mode(self) -> str:
+        """Return optional preflight header mode for frontend-signed check-ins."""
+        return str(self.account_config.get("check_in_header_mode", "") or "").strip().lower()
+
+    @staticmethod
+    def sha256_hex(value: str) -> str:
+        """Return a lowercase SHA-256 hex digest."""
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    def get_check_in_request_body(self) -> str | None:
+        """Return the POST body expected by signed frontend flows."""
+        mode = self.get_check_in_header_mode()
+        if mode == "huaibao_nonce_sha256":
+            return "{}"
+        return None
+
+    def get_check_in_status_data(self, session: curl_requests.Session, headers: dict) -> dict | None:
+        """Fetch raw New API check-in status data for signed check-in preflights."""
+        current_month = datetime.now().strftime("%Y-%m")
+        status_url = f"{self.provider_config.origin}/api/user/checkin?month={current_month}"
+        try:
+            response = session.get(status_url, headers=headers, timeout=30)
+            if response.status_code != 200:
+                print(
+                    f"⚠️ {self.account_name}: Signed check-in status preflight failed "
+                    f"with HTTP {response.status_code}"
+                )
+                return None
+
+            payload = response_resolve(response, "signed_check_in_status", self.account_name)
+            if not payload or not payload.get("success"):
+                message = payload.get("message", "Invalid status response") if payload else "Invalid status response"
+                print(f"⚠️ {self.account_name}: Signed check-in status preflight failed: {message}")
+                return None
+
+            data = payload.get("data", {})
+            return data if isinstance(data, dict) else None
+        except Exception as e:
+            print(f"⚠️ {self.account_name}: Signed check-in status preflight error: {e}")
+            return None
+
+    def add_huaibao_check_in_headers(
+        self,
+        session: curl_requests.Session,
+        headers: dict,
+        api_user: str | int,
+    ) -> dict | None:
+        """Add nonce signature headers used by some New API frontends."""
+        status_data = self.get_check_in_status_data(session, headers)
+        nonce = (status_data or {}).get("checkin_nonce")
+        if not nonce:
+            return {"success": False, "error": "Missing checkin_nonce for signed check-in"}
+
+        timestamp = str(int(time.time()))
+        signature = self.sha256_hex(f"{api_user}:{timestamp}:{nonce}")
+        headers["X-Checkin-Timestamp"] = timestamp
+        headers["X-Checkin-Signature"] = signature
+        print(f"ℹ️ {self.account_name}: Added signed check-in nonce headers")
+        return None
+
+    def add_windhub_game_integrity_headers(self, headers: dict, body_text: str) -> None:
+        """Add public frontend game-integrity headers used by some New API sites."""
+        user_agent = headers.get("User-Agent", "")
+        language = str(headers.get("Accept-Language", "en-US")).split(",", 1)[0] or "en-US"
+        platform = str(self.account_config.get("game_client_platform", "Win32"))
+        timezone = str(self.account_config.get("game_client_timezone", "Asia/Shanghai"))
+        hardware_concurrency = str(self.account_config.get("game_client_hardware_concurrency", "8"))
+        device_memory = str(self.account_config.get("game_client_device_memory", "8"))
+        fingerprint_source = "|".join(
+            [user_agent, language, platform, timezone, hardware_concurrency, device_memory]
+        )
+
+        headers["X-Game-Action-Id"] = str(uuid.uuid4())
+        headers["X-Game-Client-Ts"] = str(int(time.time() * 1000))
+        headers["X-Game-Session-Id"] = str(uuid.uuid4())
+        headers["X-Game-Client-Seq"] = "1"
+        headers["X-Game-Client-Fingerprint"] = self.sha256_hex(fingerprint_source)
+        headers["X-Game-Body-SHA256"] = self.sha256_hex(body_text)
+        print(f"ℹ️ {self.account_name}: Added game integrity check-in headers")
+
+    def solve_windhub_pow(self, challenge: str, difficulty: int) -> dict | None:
+        """Solve Windhub's public frontend proof-of-work challenge."""
+        if not challenge or difficulty < 0:
+            return None
+
+        prefix = "0" * difficulty
+        max_nonce = int(self.account_config.get("pow_max_nonce", 20_000_000))
+        start_time = time.perf_counter()
+
+        for nonce in range(max_nonce + 1):
+            digest = self.sha256_hex(f"{challenge}{nonce}")
+            if digest.startswith(prefix):
+                return {
+                    "nonce": nonce,
+                    "hash": digest,
+                    "time": round(time.perf_counter() - start_time, 2),
+                }
+
+        return None
+
+    def get_windhub_pow_token(self, session: curl_requests.Session, headers: dict) -> str | None:
+        """Build a Windhub pow_token using the same public flow as the frontend."""
+        challenge_url = f"{self.provider_config.origin}/api/user/self/pow/challenge"
+        try:
+            response = session.get(challenge_url, headers=headers, timeout=30)
+            if response.status_code != 200:
+                print(
+                    f"⚠️ {self.account_name}: Windhub PoW challenge failed "
+                    f"with HTTP {response.status_code}"
+                )
+                return None
+
+            payload = response_resolve(response, "windhub_pow_challenge", self.account_name)
+            if not payload or not payload.get("success"):
+                message = payload.get("message", "Invalid PoW challenge") if payload else "Invalid PoW challenge"
+                print(f"⚠️ {self.account_name}: Windhub PoW challenge failed: {message}")
+                return None
+
+            data = payload.get("data", {})
+            if not isinstance(data, dict):
+                return None
+            if not data.get("enabled"):
+                return ""
+
+            difficulty = int(data.get("difficulty") or 0)
+            pow_result = self.solve_windhub_pow(str(data.get("challenge") or ""), difficulty)
+            if not pow_result:
+                print(f"⚠️ {self.account_name}: Windhub PoW solve failed")
+                return None
+
+            token_payload = {
+                "challenge": data.get("challenge"),
+                "pow": pow_result,
+                "fingerprint": {
+                    "canvas": int(self.account_config.get("pow_canvas_fp", 1642478927)),
+                    "webgl": int(self.account_config.get("pow_webgl_fp", 3627205444)),
+                },
+                "behavior": {
+                    "score": int(self.account_config.get("pow_behavior_score", 90)),
+                    "moves": int(self.account_config.get("pow_behavior_moves", 24)),
+                    "dist": int(self.account_config.get("pow_behavior_dist", 920)),
+                },
+                "automation": [],
+                "risk": int(self.account_config.get("pow_risk", 0)),
+                "ts": int(time.time() * 1000),
+                "path": data.get("path") or "",
+                "purpose": data.get("purpose") or "",
+                "body_hash": data.get("body_hash") or "",
+            }
+            token_json = json.dumps(token_payload, separators=(",", ":"))
+            print(f"ℹ️ {self.account_name}: Solved Windhub PoW challenge")
+            return base64.b64encode(token_json.encode("utf-8")).decode("ascii")
+        except Exception as e:
+            print(f"⚠️ {self.account_name}: Windhub PoW error: {e}")
+            return None
+
+    def add_signed_check_in_url_params(
+        self,
+        session: curl_requests.Session,
+        headers: dict,
+        check_in_url: str,
+    ) -> tuple[str, dict | None]:
+        """Apply account-configured signed check-in URL parameters."""
+        mode = self.get_check_in_header_mode()
+        if mode != "windhub_game_integrity":
+            return check_in_url, None
+
+        pow_token = self.get_windhub_pow_token(session, headers)
+        if pow_token is None:
+            return check_in_url, {"success": False, "error": "Failed to solve Windhub PoW challenge"}
+        if not pow_token:
+            return check_in_url, None
+
+        separator = "&" if "?" in check_in_url else "?"
+        return f"{check_in_url}{separator}{urlencode({'pow_token': pow_token})}", None
+
+    def add_signed_check_in_headers(
+        self,
+        session: curl_requests.Session,
+        headers: dict,
+        api_user: str | int,
+        body_text: str,
+    ) -> dict | None:
+        """Apply account-configured signed check-in headers."""
+        mode = self.get_check_in_header_mode()
+        if not mode:
+            return None
+        if mode == "huaibao_nonce_sha256":
+            return self.add_huaibao_check_in_headers(session, headers, api_user)
+        if mode == "windhub_game_integrity":
+            self.add_windhub_game_integrity_headers(headers, body_text)
+            return None
+        return {"success": False, "error": f"Unsupported check_in_header_mode: {mode}"}
 
     def get_custom_flow_name(self) -> str:
         """Return the optional standalone custom flow name for non-NewAPI check-ins."""
@@ -957,13 +1155,29 @@ class CheckIn:
 
         checkin_headers = headers.copy()
         checkin_headers.update({"Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest"})
+        request_body = self.get_check_in_request_body()
+        sign_error = self.add_signed_check_in_headers(
+            session,
+            checkin_headers,
+            api_user,
+            request_body or "",
+        )
+        if sign_error:
+            return sign_error
 
         check_in_url = self.provider_config.get_check_in_url(api_user)
         if not check_in_url:
             print(f"❌ {self.account_name}: No check-in URL configured")
             return {"success": False, "error": "No check-in URL configured"}
 
-        response = session.post(check_in_url, headers=checkin_headers, timeout=30)
+        check_in_url, url_error = self.add_signed_check_in_url_params(session, checkin_headers, check_in_url)
+        if url_error:
+            return url_error
+
+        if request_body is None:
+            response = session.post(check_in_url, headers=checkin_headers, timeout=30)
+        else:
+            response = session.post(check_in_url, headers=checkin_headers, data=request_body, timeout=30)
 
         print(f"📨 {self.account_name}: Response status code {response.status_code}")
 
@@ -987,6 +1201,7 @@ class CheckIn:
                 or json_data.get("code") == 0
                 or json_data.get("success")
                 or "已经签到" in message
+                or "已签到" in message
                 or "签到成功" in message
             ):
                 # 提取签到数据
