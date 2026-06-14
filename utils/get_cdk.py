@@ -29,6 +29,8 @@ from utils.storage_state import load_storage_state_file, load_storage_state_from
 if TYPE_CHECKING:
     from utils.config import AccountConfig
 
+X666_COOKIE_AUTH_PREFIX = "cookie:"
+
 
 def get_runawaytime_cdk(
     account_config: "AccountConfig",
@@ -257,7 +259,7 @@ async def _get_x666_user_token(
         try:
             parts = token.split('.')
             if len(parts) != 3:
-                return False
+                return True
 
             # 解码 payload（添加 padding）
             payload_b64 = parts[1]
@@ -269,12 +271,26 @@ async def _get_x666_user_token(
             exp = payload.get('exp')
 
             if not exp:
-                return False
+                return True
 
             # 检查是否过期（exp 是秒级时间戳）
             return exp > time.time()
         except Exception:
             return False
+
+    async def get_x666_cookie_auth(context) -> str | None:
+        """Return the auth_token cookie marker when x666 uses cookie sessions."""
+        cookies = await context.cookies("https://up.x666.me/")
+        for cookie in cookies:
+            if cookie.get("name") != "auth_token":
+                continue
+            expires = cookie.get("expires", -1)
+            if expires and expires > 0 and expires <= time.time():
+                return None
+            value = cookie.get("value")
+            if value:
+                return f"{X666_COOKIE_AUTH_PREFIX}{value}"
+        return None
 
     username_hash = hashlib.sha256(username.encode()).hexdigest()[:8]
     cache_file_path = f"storage-states/x666_up_{username_hash}.json"
@@ -317,6 +333,12 @@ async def _get_x666_user_token(
                 # Step 1: 导航到 up.x666.me 并检查是否已有 userToken
                 await page.goto("https://up.x666.me/", wait_until="domcontentloaded")
                 await page.wait_for_timeout(2000)
+
+                existing_cookie_auth = await get_x666_cookie_auth(context)
+                if existing_cookie_auth:
+                    print(f"✅ {account_name}: Cached x666 auth_token cookie is available")
+                    await context.storage_state(path=cache_file_path)
+                    return existing_cookie_auth
 
                 # 检查 localStorage 中是否已有 userToken（缓存有效时）
                 existing_token = await page.evaluate("() => localStorage.getItem('userToken')")
@@ -456,6 +478,12 @@ async def _get_x666_user_token(
                     await context.storage_state(path=cache_file_path)
                     print(f"✅ {account_name}: Storage state saved for x666 up")
                     return user_token
+
+                cookie_auth = await get_x666_cookie_auth(context)
+                if cookie_auth:
+                    await context.storage_state(path=cache_file_path)
+                    print(f"✅ {account_name}: Storage state saved for x666 cookie auth")
+                    return cookie_auth
                 else:
                     print(f"❌ {account_name}: Failed to obtain userToken from up.x666.me")
                     await take_screenshot(page, "x666_token_failed", account_name)
@@ -517,6 +545,11 @@ async def get_x666_cdk(
         yield False, {"error": "Failed to obtain access_token via auto-login"}
         return
 
+    x666_cookie_auth_token = None
+    if isinstance(access_token, str) and access_token.startswith(X666_COOKIE_AUTH_PREFIX):
+        x666_cookie_auth_token = access_token.removeprefix(X666_COOKIE_AUTH_PREFIX)
+        access_token = None
+
     http_proxy = proxy_resolve(proxy_config)
 
     try:
@@ -536,18 +569,21 @@ async def get_x666_cdk(
             }
 
             session.cookies.set("i18next", "en")
+            if x666_cookie_auth_token:
+                session.cookies.set("auth_token", x666_cookie_auth_token, domain="up.x666.me", path="/")
 
             # 先获取用户信息，检查是否可以抽奖
             status_headers = headers.copy()
             status_headers.update(
                 {
-                    "authorization": f"Bearer {access_token}",
                     "referer": "https://up.x666.me/",
                     "sec-fetch-dest": "empty",
                     "sec-fetch-mode": "cors",
                     "sec-fetch-site": "same-origin",
                 }
             )
+            if access_token:
+                status_headers["authorization"] = f"Bearer {access_token}"
 
             status_response = session.get(
                 "https://up.x666.me/api/checkin/status",
@@ -585,7 +621,6 @@ async def get_x666_cdk(
             spin_headers = headers.copy()
             spin_headers.update(
                 {
-                    "authorization": f"Bearer {access_token}",
                     "content-length": "0",
                     "content-type": "application/json",
                     "origin": "https://up.x666.me",
@@ -595,6 +630,8 @@ async def get_x666_cdk(
                     "sec-fetch-site": "same-origin",
                 }
             )
+            if access_token:
+                spin_headers["authorization"] = f"Bearer {access_token}"
 
             response = session.post(
                 "https://up.x666.me/api/checkin/spin",
