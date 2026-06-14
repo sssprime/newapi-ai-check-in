@@ -29,7 +29,7 @@ from utils.get_cf_clearance import get_cf_clearance
 from utils.get_headers import get_browser_headers, get_curl_cffi_impersonate, print_browser_headers
 from utils.http_utils import proxy_resolve, response_resolve
 from utils.mask_utils import mask_username
-from utils.storage_state import ensure_storage_state_from_env
+from utils.storage_state import load_storage_state_file, load_storage_state_from_env, merge_storage_states
 from utils.topup import topup
 
 
@@ -2498,13 +2498,6 @@ class CheckIn:
             return False, {"error": "Incomplete Linux.do account information"}
 
         cache_file_path = self.get_custom_flow_storage_path("abrdns", linuxdo_account.username)
-        ensure_storage_state_from_env(
-            cache_file_path,
-            self.account_name,
-            linuxdo_account.username,
-            env_name="STORATE_STATES_LINUXDO",
-        )
-
         async with AsyncCamoufox(
             headless=False,
             humanize=True,
@@ -2513,11 +2506,19 @@ class CheckIn:
             proxy=self.camoufox_proxy_config,
             os="macos",
         ) as browser:
-            storage_state = cache_file_path if os.path.exists(cache_file_path) else None
-            if storage_state:
+            cached_state = load_storage_state_file(cache_file_path)
+            linuxdo_state = load_storage_state_from_env(
+                self.account_name,
+                linuxdo_account.username,
+                env_name="STORATE_STATES_LINUXDO",
+            )
+            storage_state = merge_storage_states(cached_state, linuxdo_state)
+            if cached_state:
                 print(f"ℹ️ {self.account_name}: Found abrdns cache file, restoring storage state")
             else:
                 print(f"ℹ️ {self.account_name}: No abrdns cache file found, starting fresh")
+            if linuxdo_state:
+                print(f"ℹ️ {self.account_name}: Merged Linux.do storage state for OAuth")
 
             context = await browser.new_context(storage_state=storage_state)
             page = await context.new_page()
