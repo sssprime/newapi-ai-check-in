@@ -791,7 +791,21 @@ class CheckIn:
                                     wait_until="domcontentloaded",
                                     timeout=45000,
                                 )
-                                await page.wait_for_timeout(5000)
+                                await page.wait_for_timeout(20000)
+                                waf_cookie_names = [
+                                    cookie.get("name")
+                                    for cookie in await page.context.cookies(self.provider_config.origin)
+                                    if cookie.get("name") in {"acw_tc", "cdn_sec_tc", "acw_sc__v2"}
+                                ]
+                                if waf_cookie_names:
+                                    print(f"ℹ️ {self.account_name}: WAF probe cookies present: {waf_cookie_names}")
+
+                                try:
+                                    await page.reload(wait_until="domcontentloaded", timeout=45000)
+                                    await page.wait_for_timeout(3000)
+                                except Exception:
+                                    pass
+
                                 body_text = await page.locator("body").inner_text(timeout=10000)
                                 try:
                                     response = json.loads(body_text)
