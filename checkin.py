@@ -5,9 +5,11 @@ CheckIn 类
 
 import asyncio
 import hashlib
+import html
 import inspect
 import json
 import os
+import re
 import tempfile
 from urllib.parse import urlencode, urlparse
 
@@ -2292,8 +2294,15 @@ class CheckIn:
         status_code = int(response_data.get("status") or 0)
         payload = response_data.get("payload")
         text = str(response_data.get("text") or "")
+        looks_like_html = text.lstrip().lower().startswith(("<!doctype", "<html")) or "<html" in text[:500].lower()
 
-        message = text
+        def html_to_text(raw_text: str) -> str:
+            stripped = re.sub(r"<script[\s\S]*?</script>|<style[\s\S]*?</style>", " ", raw_text, flags=re.I)
+            stripped = re.sub(r"<[^>]+>", " ", stripped)
+            stripped = html.unescape(stripped)
+            return re.sub(r"\s+", " ", stripped).strip()
+
+        message = html_to_text(text) if looks_like_html else text
         if isinstance(payload, dict):
             message_value = payload.get("message", payload.get("msg", payload.get("detail", payload.get("data", ""))))
             if isinstance(message_value, (dict, list)):
@@ -2303,9 +2312,11 @@ class CheckIn:
 
         message_lower = message.lower()
         already_keywords = ["already", "already checked", "already signed", "已签到", "已经签到", "重复签到", "今日已"]
-        success_keywords = ["success", "check-in successful", "checked in", "签到成功", "领取成功", "成功"]
+        success_keywords = ["check-in successful", "checked in", "签到成功", "领取成功", "成功"]
         is_already = any(keyword in message_lower or keyword in message for keyword in already_keywords)
         is_success_message = any(keyword in message_lower or keyword in message for keyword in success_keywords)
+        if looks_like_html and not is_already:
+            is_success_message = any(keyword in message for keyword in ["签到成功", "领取成功"])
 
         explicit_success = isinstance(payload, dict) and (
             payload.get("success") is True or payload.get("ok") is True or payload.get("code") == 0

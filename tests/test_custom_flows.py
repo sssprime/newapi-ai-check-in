@@ -61,6 +61,21 @@ def test_resolve_abrdns_response_already_checked_in():
     assert result["success"] is True
 
 
+def test_resolve_abrdns_response_html_already_checked_in_is_cleaned():
+    checkin = make_checkin()
+
+    result = checkin.resolve_abrdns_checkin_response(
+        {
+            "status": 200,
+            "payload": None,
+            "text": "<!DOCTYPE html><html><body><style>.success{}</style><main>今日已签到 获得 $2.02</main></body></html>",
+        }
+    )
+
+    assert result["success"] is True
+    assert result["message"] == "今日已签到 获得 $2.02"
+
+
 def test_resolve_abrdns_response_unauthorized_requires_login():
     checkin = make_checkin()
 
