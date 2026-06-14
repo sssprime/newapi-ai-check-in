@@ -730,6 +730,9 @@ class CheckIn:
                         for header_name in (self.provider_config.api_user_key, "Authorization", "X-Requested-With"):
                             if headers.get(header_name):
                                 fetch_headers[header_name] = headers[header_name]
+                        api_user_value = headers.get(self.provider_config.api_user_key)
+                        if api_user_value and self.provider_config.api_user_key.lower() == "new-api-user":
+                            fetch_headers["New-Api-User"] = api_user_value
 
                     # Fetch user info from inside the browser session. This lets the site handle
                     # its own browser/WAF cookies without reverse-engineering them.
@@ -750,6 +753,8 @@ class CheckIn:
                                        return {
                                            success: false,
                                            message: `Invalid JSON response: HTTP ${response.status}`,
+                                           contentType: response.headers.get('content-type') || '',
+                                           textPrefix: text.slice(0, 120),
                                        };
                                    }
                                 }""",
