@@ -330,15 +330,15 @@ async def _get_x666_user_token(
             page = await context.new_page()
 
             try:
-                # Step 1: 导航到 up.x666.me 并检查是否已有 userToken
-                await page.goto("https://up.x666.me/", wait_until="domcontentloaded")
-                await page.wait_for_timeout(2000)
-
                 existing_cookie_auth = await get_x666_cookie_auth(context)
                 if existing_cookie_auth:
                     print(f"✅ {account_name}: Cached x666 auth_token cookie is available")
                     await context.storage_state(path=cache_file_path)
                     return existing_cookie_auth
+
+                # Step 1: 导航到 up.x666.me 并检查是否已有 userToken
+                await page.goto("https://up.x666.me/", wait_until="domcontentloaded")
+                await page.wait_for_timeout(2000)
 
                 # 检查 localStorage 中是否已有 userToken（缓存有效时）
                 existing_token = await page.evaluate("() => localStorage.getItem('userToken')")
