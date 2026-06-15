@@ -5,6 +5,8 @@ from typing import Literal
 
 from curl_cffi import requests as curl_requests
 
+TELEGRAM_CHUNK_SIZE = 3900
+
 
 class NotificationKit:
 	@property
@@ -112,9 +114,56 @@ class NotificationKit:
 		if not self.telegram_bot_token or not self.telegram_chat_id:
 			raise ValueError('Telegram Bot Token or Chat ID not configured')
 
-		text = f'*{title}*\n{content}'
-		data = {'chat_id': self.telegram_chat_id, 'text': text, 'parse_mode': 'Markdown'}
-		curl_requests.post(f'https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage', json=data, timeout=30)
+		text = f'{title}\n{content}'
+		chunks = self.split_telegram_text(text)
+		for index, chunk in enumerate(chunks, start=1):
+			if len(chunks) > 1:
+				chunk = f'{chunk}\n\n[{index}/{len(chunks)}]'
+			data = {'chat_id': self.telegram_chat_id, 'text': chunk}
+			response = curl_requests.post(
+				f'https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage',
+				json=data,
+				timeout=30,
+			)
+			self.raise_for_telegram_error(response)
+
+	def split_telegram_text(self, text: str) -> list[str]:
+		if len(text) <= TELEGRAM_CHUNK_SIZE:
+			return [text]
+
+		chunks = []
+		remaining = text
+		while remaining:
+			if len(remaining) <= TELEGRAM_CHUNK_SIZE:
+				chunks.append(remaining)
+				break
+
+			split_at = max(
+				remaining.rfind('\n', 0, TELEGRAM_CHUNK_SIZE),
+				remaining.rfind(' ', 0, TELEGRAM_CHUNK_SIZE),
+			)
+			if split_at < TELEGRAM_CHUNK_SIZE // 2:
+				split_at = TELEGRAM_CHUNK_SIZE
+
+			chunks.append(remaining[:split_at].rstrip())
+			remaining = remaining[split_at:].lstrip()
+		return chunks
+
+	@staticmethod
+	def raise_for_telegram_error(response):
+		status_code = getattr(response, 'status_code', 0)
+		response_text = getattr(response, 'text', '')
+		if status_code >= 400:
+			raise ValueError(f'Telegram API HTTP {status_code}: {response_text[:200]}')
+
+		try:
+			payload = response.json()
+		except Exception:
+			return
+
+		if isinstance(payload, dict) and payload.get('ok') is False:
+			description = payload.get('description') or response_text[:200] or 'unknown error'
+			raise ValueError(f'Telegram API error: {description}')
 
 	def push_message(self, title: str, content: str, msg_type: Literal['text', 'html'] = 'text'):
 		notifications = [
