@@ -1,8 +1,5 @@
 name: newapi.ai check-in
 on:
-  schedule:
-    # Runs every 8 hours, matching the upstream project.
-    - cron: '0 */8 * * *'
   workflow_dispatch:
     inputs:
       accounts:
